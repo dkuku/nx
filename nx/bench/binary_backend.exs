@@ -16,11 +16,43 @@ defmodule Nx.Bench.Runner do
         time / 1_000.0
       end
 
+    mem = measure_memory(fun)
+
     avg = Enum.sum(times) / runs
     min = Enum.min(times)
     max = Enum.max(times)
 
-    :io.format("~-35s ~10.3f ms  (min: ~8.3f ms, max: ~8.3f ms)~n", [name, avg, min, max])
+    :io.format("~-30s ~8.3f ms  (min: ~6.3f ms, max: ~6.3f ms)  | ~9s~n", [
+      name,
+      avg,
+      min,
+      max,
+      format_bytes(mem)
+    ])
+  end
+
+  defp measure_memory(fun) do
+    parent = self()
+
+    spawn(fn ->
+      :erlang.garbage_collect()
+      {:memory, before_mem} = :erlang.process_info(self(), :memory)
+      res = fun.()
+      {:memory, after_mem} = :erlang.process_info(self(), :memory)
+      send(parent, {:mem, max(0, after_mem - before_mem), res})
+    end)
+
+    receive do
+      {:mem, bytes, _res} -> bytes
+    end
+  end
+
+  defp format_bytes(bytes) do
+    cond do
+      bytes >= 1_048_576 -> :io_lib.format("~.2f MB", [bytes / 1_048_576]) |> to_string()
+      bytes >= 1024 -> :io_lib.format("~.2f KB", [bytes / 1024]) |> to_string()
+      true -> "#{bytes} B"
+    end
   end
 end
 
