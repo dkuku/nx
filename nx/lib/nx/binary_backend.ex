@@ -1391,9 +1391,21 @@ defmodule Nx.BinaryBackend do
 
         defp unquote(fun)(axis), do: unquote(fun)(axis, unquote(float_init))
 
+        defp unquote(fun)(
+               <<x1::float-native-size(unquote(size)), x2::float-native-size(unquote(size)),
+                 x3::float-native-size(unquote(size)), x4::float-native-size(unquote(size)),
+                 rest::binary>>,
+               acc
+             )
+             when is_float(acc) do
+          s1 = Kernel.unquote(sym)(x1, x2)
+          s2 = Kernel.unquote(sym)(x3, x4)
+          unquote(fun)(rest, Kernel.unquote(sym)(acc, Kernel.unquote(sym)(s1, s2)))
+        end
+
         defp unquote(fun)(<<x::float-native-size(unquote(size)), rest::binary>>, acc)
              when is_float(acc),
-             do: unquote(fun)(rest, unquote(sym)(acc, x))
+             do: unquote(fun)(rest, Kernel.unquote(sym)(acc, x))
 
         defp unquote(fun)(<<x_bin::size(unquote(size))-bits, rest::binary>>, acc) do
           x =
@@ -1418,6 +1430,20 @@ defmodule Nx.BinaryBackend do
 
         defp unquote(fun)(<<x_bin::size(unquote(size))-bits, rest::binary>>),
           do: unquote(fun)(rest, Nx.Shared.read_non_finite(x_bin, unquote(size)))
+
+        defp unquote(fun)(
+               <<x1::float-native-size(unquote(size)), x2::float-native-size(unquote(size)),
+                 x3::float-native-size(unquote(size)), x4::float-native-size(unquote(size)),
+                 rest::binary>>,
+               cur
+             )
+             when is_float(cur) do
+          c1 = if(unquote(comp_sym)(x1, cur), do: x1, else: cur)
+          c2 = if(unquote(comp_sym)(x2, c1), do: x2, else: c1)
+          c3 = if(unquote(comp_sym)(x3, c2), do: x3, else: c2)
+          c4 = if(unquote(comp_sym)(x4, c3), do: x4, else: c3)
+          unquote(fun)(rest, c4)
+        end
 
         defp unquote(fun)(<<x::float-native-size(unquote(size)), rest::binary>>, cur)
              when is_float(cur),
@@ -1459,7 +1485,7 @@ defmodule Nx.BinaryBackend do
                <<x::integer-unquote(sign)-native-size(unquote(size)), rest::binary>>,
                acc
              ),
-             do: unquote(fun)(rest, unquote(sym)(acc, x))
+             do: unquote(fun)(rest, Kernel.unquote(sym)(acc, x))
 
         defp unquote(fun)(<<>>, acc),
           do: <<acc::integer-unquote(sign)-native-size(unquote(size))>>
@@ -1494,7 +1520,7 @@ defmodule Nx.BinaryBackend do
                <<x::integer-unquote(sign)-native-size(unquote(size)), rest::binary>>,
                acc
              ),
-             do: unquote(fun)(rest, unquote(sym)(acc, x))
+             do: unquote(fun)(rest, Kernel.unquote(sym)(acc, x))
 
         defp unquote(fun)(<<>>, acc),
           do: <<acc::integer-unquote(sign)-native-size(32)>>
@@ -2514,12 +2540,29 @@ defmodule Nx.BinaryBackend do
       do: &unquote(fun)(&1, &2, 0.0)
 
     defp unquote(fun)(
+           <<x1::float-native-size(unquote(size)), x2::float-native-size(unquote(size)),
+             x3::float-native-size(unquote(size)), x4::float-native-size(unquote(size)),
+             rest1::binary>>,
+           <<y1::float-native-size(unquote(size)), y2::float-native-size(unquote(size)),
+             y3::float-native-size(unquote(size)), y4::float-native-size(unquote(size)),
+             rest2::binary>>,
+           acc
+         )
+         when is_float(acc) do
+      p1 = Kernel.*(x1, y1)
+      p2 = Kernel.*(x2, y2)
+      p3 = Kernel.*(x3, y3)
+      p4 = Kernel.*(x4, y4)
+      unquote(fun)(rest1, rest2, Kernel.+(acc, Kernel.+(Kernel.+(p1, p2), Kernel.+(p3, p4))))
+    end
+
+    defp unquote(fun)(
            <<x::float-native-size(unquote(size)), rest1::binary>>,
            <<y::float-native-size(unquote(size)), rest2::binary>>,
            acc
          )
          when is_float(acc),
-         do: unquote(fun)(rest1, rest2, acc + x * y)
+         do: unquote(fun)(rest1, rest2, Kernel.+(acc, Kernel.*(x, y)))
 
     defp unquote(fun)(
            <<x_bin::size(unquote(size))-bits, rest1::binary>>,
@@ -2560,11 +2603,29 @@ defmodule Nx.BinaryBackend do
          do: &unquote(fun)(&1, &2, 0)
 
     defp unquote(fun)(
+           <<x1::integer-unquote(sign)-native-size(unquote(size)),
+             x2::integer-unquote(sign)-native-size(unquote(size)),
+             x3::integer-unquote(sign)-native-size(unquote(size)),
+             x4::integer-unquote(sign)-native-size(unquote(size)), rest1::binary>>,
+           <<y1::integer-unquote(sign)-native-size(unquote(size)),
+             y2::integer-unquote(sign)-native-size(unquote(size)),
+             y3::integer-unquote(sign)-native-size(unquote(size)),
+             y4::integer-unquote(sign)-native-size(unquote(size)), rest2::binary>>,
+           acc
+         ) do
+      p1 = Kernel.*(x1, y1)
+      p2 = Kernel.*(x2, y2)
+      p3 = Kernel.*(x3, y3)
+      p4 = Kernel.*(x4, y4)
+      unquote(fun)(rest1, rest2, Kernel.+(acc, Kernel.+(Kernel.+(p1, p2), Kernel.+(p3, p4))))
+    end
+
+    defp unquote(fun)(
            <<x::integer-unquote(sign)-native-size(unquote(size)), rest1::binary>>,
            <<y::integer-unquote(sign)-native-size(unquote(size)), rest2::binary>>,
            acc
          ),
-         do: unquote(fun)(rest1, rest2, acc + x * y)
+         do: unquote(fun)(rest1, rest2, Kernel.+(acc, Kernel.*(x, y)))
 
     defp unquote(fun)(<<>>, <<>>, acc),
       do: <<acc::integer-unquote(sign)-native-size(unquote(size))>>
@@ -2703,7 +2764,12 @@ defmodule Nx.BinaryBackend do
     {reverse_pos, read_size} =
       aggregate_read(reverse_pos, tuple_size(shape) - 1, Enum.reverse(axes), size)
 
-    path = Enum.reverse(reverse_pre, [(&:erlang.list_to_bitstring/1) | Enum.reverse(reverse_pos)])
+    path =
+      case reverse_pos do
+        [] -> Enum.reverse(reverse_pre)
+        _ -> Enum.reverse(reverse_pre, [(&:erlang.list_to_bitstring/1) | Enum.reverse(reverse_pos)])
+      end
+
     {chunk_size, read_size, path}
   end
 
@@ -2715,10 +2781,10 @@ defmodule Nx.BinaryBackend do
 
   defp aggregate_path([], [], _i, pre, pos), do: {pre, pos}
 
-  defp aggregate_read([{axis, weight} | shape], i, [i | axis], _size),
-    do: aggregate_read(shape, i - 1, axis, axis * weight)
+  defp aggregate_read([{dim, weight} | shape], i, [i | axes], _size),
+    do: aggregate_read(shape, i - 1, axes, dim * weight)
 
-  defp aggregate_read(shape, _i, _axis, size),
+  defp aggregate_read(shape, _i, _axes, size),
     do: {shape, size}
 
   ## Weighted shapes
