@@ -551,11 +551,12 @@ defmodule Nx.BinaryBackend do
 
     {right, right_contract_axes} = bin_dot_transpose_contract_axes(right, contract_axes2)
 
-    bin_zip_reduce(left, left_contract_axes, right, right_contract_axes, type, 0, fn
-      lhs, rhs, acc ->
-        res = binary_to_number(lhs, t1) * binary_to_number(rhs, t2) + acc
-        {res, res}
-    end)
+    fast_dot(left, left_contract_axes, right, right_contract_axes, type) ||
+      bin_zip_reduce(left, left_contract_axes, right, right_contract_axes, type, 0, fn
+        lhs, rhs, acc ->
+          res = binary_to_number(lhs, t1) * binary_to_number(rhs, t2) + acc
+          {res, res}
+      end)
   end
 
   defp bin_dot_transpose_contract_axes(tensor, contract_axes) do
@@ -1333,10 +1334,11 @@ defmodule Nx.BinaryBackend do
   @impl true
   def sum(out, %{type: type} = tensor, opts) do
     data =
-      bin_reduce(tensor, out.type, 0, opts, fn bin, acc ->
-        res = binary_to_number(bin, type) + acc
-        {res, res}
-      end)
+      fast_reduce(:sum, tensor, out.type, opts) ||
+        bin_reduce(tensor, out.type, 0, opts, fn bin, acc ->
+          res = binary_to_number(bin, type) + acc
+          {res, res}
+        end)
 
     from_binary(out, data)
   end
@@ -1344,10 +1346,11 @@ defmodule Nx.BinaryBackend do
   @impl true
   def product(out, %{type: type} = tensor, opts) do
     data =
-      bin_reduce(tensor, out.type, 1, opts, fn bin, acc ->
-        res = binary_to_number(bin, type) * acc
-        {res, res}
-      end)
+      fast_reduce(:prod, tensor, out.type, opts) ||
+        bin_reduce(tensor, out.type, 1, opts, fn bin, acc ->
+          res = binary_to_number(bin, type) * acc
+          {res, res}
+        end)
 
     from_binary(out, data)
   end
@@ -1355,11 +1358,12 @@ defmodule Nx.BinaryBackend do
   @impl true
   def reduce_max(out, %{type: type} = tensor, opts) do
     data =
-      bin_reduce(tensor, out.type, :first, opts, fn bin, acc ->
-        val = binary_to_number(bin, type)
-        res = if acc == :first, do: val, else: non_finite_max(acc, val)
-        {res, res}
-      end)
+      fast_reduce(:max, tensor, out.type, opts) ||
+        bin_reduce(tensor, out.type, :first, opts, fn bin, acc ->
+          val = binary_to_number(bin, type)
+          res = if acc == :first, do: val, else: non_finite_max(acc, val)
+          {res, res}
+        end)
 
     from_binary(out, data)
   end
@@ -1375,11 +1379,12 @@ defmodule Nx.BinaryBackend do
   @impl true
   def reduce_min(out, %{type: type} = tensor, opts) do
     data =
-      bin_reduce(tensor, out.type, :first, opts, fn bin, acc ->
-        val = binary_to_number(bin, type)
-        res = if acc == :first, do: val, else: non_finite_min(acc, val)
-        {res, res}
-      end)
+      fast_reduce(:min, tensor, out.type, opts) ||
+        bin_reduce(tensor, out.type, :first, opts, fn bin, acc ->
+          val = binary_to_number(bin, type)
+          res = if acc == :first, do: val, else: non_finite_min(acc, val)
+          {res, res}
+        end)
 
     from_binary(out, data)
   end
@@ -1391,6 +1396,149 @@ defmodule Nx.BinaryBackend do
   defp non_finite_min(:neg_infinity, _), do: :neg_infinity
   defp non_finite_min(_, :neg_infinity), do: :neg_infinity
   defp non_finite_min(x, y) when is_number(x) and is_number(y), do: Kernel.min(x, y)
+
+  defp fast_reduce(op, %T{type: {_, size} = in_type, shape: shape} = tensor, out_type, opts) do
+    if reducer = axis_reducer(op, in_type, out_type) do
+      view =
+        if axes = opts[:axes] do
+          aggregate_axes(to_binary(tensor), axes, shape, size)
+        else
+          [to_binary(tensor)]
+        end
+
+      for axis <- view, into: <<>>, do: reducer.(axis)
+    end
+  end
+
+  for {op, kind, sym, comp_sym, float_init, int_init} <- [
+        {:sum, :acc, :+, nil, 0.0, 0},
+        {:prod, :acc, :*, nil, 1.0, 1},
+        {:max, :comp, nil, :>, nil, nil},
+        {:min, :comp, nil, :<, nil, nil}
+      ] do
+    for size <- [32, 64] do
+      fun = :"#{op}_axis_f#{size}"
+
+      defp axis_reducer(unquote(op), {:f, unquote(size)}, {:f, unquote(size)}),
+        do: &unquote(fun)(&1)
+
+      if kind == :acc do
+        c_fun = if op == :sum, do: :add, else: :multiply
+
+        defp unquote(fun)(axis), do: unquote(fun)(axis, unquote(float_init))
+
+        defp unquote(fun)(<<x::float-native-size(unquote(size)), rest::binary>>, acc)
+             when is_float(acc),
+             do: unquote(fun)(rest, unquote(sym)(acc, x))
+
+        defp unquote(fun)(<<x_bin::size(unquote(size))-bits, rest::binary>>, acc) do
+          x =
+            case x_bin do
+              <<f::float-native-size(unquote(size))>> -> f
+              _ -> Nx.Shared.read_non_finite(x_bin, unquote(size))
+            end
+
+          unquote(fun)(rest, Complex.unquote(c_fun)(acc, x))
+        end
+
+        defp unquote(fun)(<<>>, acc) when is_float(acc),
+          do: <<acc::float-native-size(unquote(size))>>
+
+        defp unquote(fun)(<<>>, acc),
+          do: scalar_to_binary!(acc, {:f, unquote(size)})
+      else
+        nf_fun = if op == :max, do: :non_finite_max, else: :non_finite_min
+
+        defp unquote(fun)(<<x::float-native-size(unquote(size)), rest::binary>>),
+          do: unquote(fun)(rest, x)
+
+        defp unquote(fun)(<<x_bin::size(unquote(size))-bits, rest::binary>>),
+          do: unquote(fun)(rest, Nx.Shared.read_non_finite(x_bin, unquote(size)))
+
+        defp unquote(fun)(<<x::float-native-size(unquote(size)), rest::binary>>, cur)
+             when is_float(cur),
+             do: unquote(fun)(rest, if(unquote(comp_sym)(x, cur), do: x, else: cur))
+
+        defp unquote(fun)(<<x_bin::size(unquote(size))-bits, rest::binary>>, cur) do
+          x =
+            case x_bin do
+              <<f::float-native-size(unquote(size))>> -> f
+              _ -> Nx.Shared.read_non_finite(x_bin, unquote(size))
+            end
+
+          unquote(fun)(rest, unquote(nf_fun)(cur, x))
+        end
+
+        defp unquote(fun)(<<>>, cur) when is_float(cur),
+          do: <<cur::float-native-size(unquote(size))>>
+
+        defp unquote(fun)(<<>>, cur),
+          do: scalar_to_binary!(cur, {:f, unquote(size)})
+      end
+    end
+
+    for {type, sign} <- [{:s, quote(do: signed)}, {:u, quote(do: unsigned)}],
+        size <- [8, 16, 32, 64] do
+      fun = :"#{op}_axis_#{type}#{size}"
+
+      defp axis_reducer(
+             unquote(op),
+             {unquote(type), unquote(size)},
+             {unquote(type), unquote(size)}
+           ),
+           do: &unquote(fun)(&1)
+
+      if kind == :acc do
+        defp unquote(fun)(axis), do: unquote(fun)(axis, unquote(int_init))
+
+        defp unquote(fun)(
+               <<x::integer-unquote(sign)-native-size(unquote(size)), rest::binary>>,
+               acc
+             ),
+             do: unquote(fun)(rest, unquote(sym)(acc, x))
+
+        defp unquote(fun)(<<>>, acc),
+          do: <<acc::integer-unquote(sign)-native-size(unquote(size))>>
+      else
+        defp unquote(fun)(
+               <<first::integer-unquote(sign)-native-size(unquote(size)), rest::binary>>
+             ),
+             do: unquote(fun)(rest, first)
+
+        defp unquote(fun)(
+               <<x::integer-unquote(sign)-native-size(unquote(size)), rest::binary>>,
+               cur
+             ),
+             do: unquote(fun)(rest, if(unquote(comp_sym)(x, cur), do: x, else: cur))
+
+        defp unquote(fun)(<<>>, cur),
+          do: <<cur::integer-unquote(sign)-native-size(unquote(size))>>
+      end
+    end
+
+    if kind == :acc do
+      for {type, sign} <- [{:s, quote(do: signed)}, {:u, quote(do: unsigned)}],
+          size <- [8, 16] do
+        fun = :"#{op}_axis_#{type}#{size}_to_#{type}32"
+
+        defp axis_reducer(unquote(op), {unquote(type), unquote(size)}, {unquote(type), 32}),
+          do: &unquote(fun)(&1)
+
+        defp unquote(fun)(axis), do: unquote(fun)(axis, unquote(int_init))
+
+        defp unquote(fun)(
+               <<x::integer-unquote(sign)-native-size(unquote(size)), rest::binary>>,
+               acc
+             ),
+             do: unquote(fun)(rest, unquote(sym)(acc, x))
+
+        defp unquote(fun)(<<>>, acc),
+          do: <<acc::integer-unquote(sign)-native-size(32)>>
+      end
+    end
+  end
+
+  defp axis_reducer(_, _, _), do: nil
 
   defp non_finite_lt(:nan, _), do: false
   defp non_finite_lt(_, :nan), do: false
@@ -2363,6 +2511,83 @@ defmodule Nx.BinaryBackend do
       scalar_to_binary!(result, type)
     end
   end
+
+  defp fast_dot(t1, [_ | _] = axes1, t2, [_ | _] = axes2, type) do
+    if reducer = dot_axis_reducer(t1.type, t2.type, type) do
+      {_, s1} = t1.type
+      {_, s2} = t2.type
+
+      v1 = aggregate_axes(to_binary(t1), axes1, t1.shape, s1)
+      v2 = aggregate_axes(to_binary(t2), axes2, t2.shape, s2)
+
+      for b1 <- v1, b2 <- v2, into: <<>>, do: reducer.(b1, b2)
+    end
+  end
+
+  for size <- [32, 64] do
+    fun = :"dot_axis_f#{size}"
+
+    defp dot_axis_reducer({:f, unquote(size)}, {:f, unquote(size)}, {:f, unquote(size)}),
+      do: &unquote(fun)(&1, &2, 0.0)
+
+    defp unquote(fun)(
+           <<x::float-native-size(unquote(size)), rest1::binary>>,
+           <<y::float-native-size(unquote(size)), rest2::binary>>,
+           acc
+         )
+         when is_float(acc),
+         do: unquote(fun)(rest1, rest2, acc + x * y)
+
+    defp unquote(fun)(
+           <<x_bin::size(unquote(size))-bits, rest1::binary>>,
+           <<y_bin::size(unquote(size))-bits, rest2::binary>>,
+           acc
+         ) do
+      x =
+        case x_bin do
+          <<f::float-native-size(unquote(size))>> -> f
+          _ -> Nx.Shared.read_non_finite(x_bin, unquote(size))
+        end
+
+      y =
+        case y_bin do
+          <<f::float-native-size(unquote(size))>> -> f
+          _ -> Nx.Shared.read_non_finite(y_bin, unquote(size))
+        end
+
+      unquote(fun)(rest1, rest2, Complex.add(acc, Complex.multiply(x, y)))
+    end
+
+    defp unquote(fun)(<<>>, <<>>, acc) when is_float(acc),
+      do: <<acc::float-native-size(unquote(size))>>
+
+    defp unquote(fun)(<<>>, <<>>, acc),
+      do: scalar_to_binary!(acc, {:f, unquote(size)})
+  end
+
+  for {type, sign} <- [{:s, quote(do: signed)}, {:u, quote(do: unsigned)}],
+      size <- [8, 16, 32, 64] do
+    fun = :"dot_axis_#{type}#{size}"
+
+    defp dot_axis_reducer(
+           {unquote(type), unquote(size)},
+           {unquote(type), unquote(size)},
+           {unquote(type), unquote(size)}
+         ),
+         do: &unquote(fun)(&1, &2, 0)
+
+    defp unquote(fun)(
+           <<x::integer-unquote(sign)-native-size(unquote(size)), rest1::binary>>,
+           <<y::integer-unquote(sign)-native-size(unquote(size)), rest2::binary>>,
+           acc
+         ),
+         do: unquote(fun)(rest1, rest2, acc + x * y)
+
+    defp unquote(fun)(<<>>, <<>>, acc),
+      do: <<acc::integer-unquote(sign)-native-size(unquote(size))>>
+  end
+
+  defp dot_axis_reducer(_, _, _), do: nil
 
   defp bin_zip_reduce(t1, [_ | _] = axes1, t2, [_ | _] = axes2, type, acc, fun) do
     {_, s1} = t1.type
