@@ -1332,25 +1332,13 @@ defmodule Nx.BinaryBackend do
   end
 
   @impl true
-  def sum(out, %{type: type} = tensor, opts) do
-    data =
-      bin_reduce(tensor, out.type, 0, opts, fn bin, acc ->
-        res = binary_to_number(bin, type) + acc
-        {res, res}
-      end)
-
-    from_binary(out, data)
+  def sum(out, tensor, opts) do
+    from_binary(out, bin_reduce(:sum, tensor, out.type, opts))
   end
 
   @impl true
-  def product(out, %{type: type} = tensor, opts) do
-    data =
-      bin_reduce(tensor, out.type, 1, opts, fn bin, acc ->
-        res = binary_to_number(bin, type) * acc
-        {res, res}
-      end)
-
-    from_binary(out, data)
+  def product(out, tensor, opts) do
+    from_binary(out, bin_reduce(:prod, tensor, out.type, opts))
   end
 
   @impl true
@@ -1392,6 +1380,275 @@ defmodule Nx.BinaryBackend do
   defp non_finite_min(:neg_infinity, _), do: :neg_infinity
   defp non_finite_min(_, :neg_infinity), do: :neg_infinity
   defp non_finite_min(x, y) when is_number(x) and is_number(y), do: Kernel.min(x, y)
+
+  defp bin_reduce(op, %T{type: {_, size} = in_type, shape: shape} = tensor, out_type, opts)
+       when op in [:sum, :prod] do
+    reducer = axis_reducer(op, in_type, out_type)
+
+    view =
+      if axes = opts[:axes] do
+        aggregate_axes(to_binary(tensor), axes, shape, size)
+      else
+        [to_binary(tensor)]
+      end
+
+    for axis <- view, into: <<>>, do: reducer.(axis)
+  end
+
+  # Sum
+  defp axis_reducer(:sum, {:f, 32}, {:f, 32}), do: &sum_axis_f32(&1, 0.0)
+  defp axis_reducer(:sum, {:f, 64}, {:f, 64}), do: &sum_axis_f64(&1, 0.0)
+  defp axis_reducer(:sum, {:s, 64}, {:s, 64}), do: &sum_axis_s64(&1, 0)
+  defp axis_reducer(:sum, {:s, 32}, {:s, 32}), do: &sum_axis_s32(&1, 0)
+  defp axis_reducer(:sum, {:u, 64}, {:s, 64}), do: &sum_axis_u64_to_s64(&1, 0)
+  defp axis_reducer(:sum, {:u, 32}, {:u, 32}), do: &sum_axis_u32(&1, 0)
+
+  # Product
+  defp axis_reducer(:prod, {:f, 32}, {:f, 32}), do: &prod_axis_f32(&1, 1.0)
+  defp axis_reducer(:prod, {:f, 64}, {:f, 64}), do: &prod_axis_f64(&1, 1.0)
+  defp axis_reducer(:prod, {:s, 64}, {:s, 64}), do: &prod_axis_s64(&1, 1)
+  defp axis_reducer(:prod, {:s, 32}, {:s, 32}), do: &prod_axis_s32(&1, 1)
+
+  defp axis_reducer(op, in_type, out_type), do: fallback_axis_reducer(op, in_type, out_type)
+
+  # Sum helpers
+
+  defp sum_axis_f32(
+         <<x1::float-native-32, x2::float-native-32, x3::float-native-32, x4::float-native-32,
+           rest::binary>>,
+         acc
+       )
+       when is_float(acc) do
+    acc =
+      acc
+      |> Kernel.+(x1)
+      |> Kernel.+(x2)
+      |> Kernel.+(x3)
+      |> Kernel.+(x4)
+
+    sum_axis_f32(rest, acc)
+  end
+
+  defp sum_axis_f32(<<x::float-native-32, rest::binary>>, acc) when is_float(acc),
+    do: sum_axis_f32(rest, Kernel.+(acc, x))
+
+  defp sum_axis_f32(<<x_bin::32-bits, rest::binary>>, acc) do
+    x =
+      case x_bin do
+        <<f::float-native-32>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 32)
+      end
+
+    sum_axis_f32(rest, Complex.add(acc, x))
+  end
+
+  defp sum_axis_f32(<<>>, acc) when is_float(acc), do: <<acc::float-native-32>>
+  defp sum_axis_f32(<<>>, acc), do: scalar_to_binary!(acc, {:f, 32})
+
+  defp sum_axis_f64(
+         <<x1::float-native-64, x2::float-native-64, x3::float-native-64, x4::float-native-64,
+           rest::binary>>,
+         acc
+       )
+       when is_float(acc) do
+    acc =
+      acc
+      |> Kernel.+(x1)
+      |> Kernel.+(x2)
+      |> Kernel.+(x3)
+      |> Kernel.+(x4)
+
+    sum_axis_f64(rest, acc)
+  end
+
+  defp sum_axis_f64(<<x::float-native-64, rest::binary>>, acc) when is_float(acc),
+    do: sum_axis_f64(rest, Kernel.+(acc, x))
+
+  defp sum_axis_f64(<<x_bin::64-bits, rest::binary>>, acc) do
+    x =
+      case x_bin do
+        <<f::float-native-64>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 64)
+      end
+
+    sum_axis_f64(rest, Complex.add(acc, x))
+  end
+
+  defp sum_axis_f64(<<>>, acc) when is_float(acc), do: <<acc::float-native-64>>
+  defp sum_axis_f64(<<>>, acc), do: scalar_to_binary!(acc, {:f, 64})
+
+  defp sum_axis_s64(
+         <<x1::signed-native-64, x2::signed-native-64, x3::signed-native-64, x4::signed-native-64,
+           rest::binary>>,
+         acc
+       ) do
+    s1 = Kernel.+(x1, x2)
+    s2 = Kernel.+(x3, x4)
+    sum_axis_s64(rest, Kernel.+(acc, Kernel.+(s1, s2)))
+  end
+
+  defp sum_axis_s64(<<x::signed-native-64, rest::binary>>, acc),
+    do: sum_axis_s64(rest, Kernel.+(acc, x))
+
+  defp sum_axis_s64(<<>>, acc), do: <<acc::signed-native-64>>
+
+  defp sum_axis_s32(
+         <<x1::signed-native-32, x2::signed-native-32, x3::signed-native-32, x4::signed-native-32,
+           rest::binary>>,
+         acc
+       ) do
+    s1 = Kernel.+(x1, x2)
+    s2 = Kernel.+(x3, x4)
+    sum_axis_s32(rest, Kernel.+(acc, Kernel.+(s1, s2)))
+  end
+
+  defp sum_axis_s32(<<x::signed-native-32, rest::binary>>, acc),
+    do: sum_axis_s32(rest, Kernel.+(acc, x))
+
+  defp sum_axis_s32(<<>>, acc), do: <<acc::signed-native-32>>
+
+  defp sum_axis_u64_to_s64(
+         <<x1::unsigned-native-64, x2::unsigned-native-64, x3::unsigned-native-64,
+           x4::unsigned-native-64, rest::binary>>,
+         acc
+       ) do
+    s1 = Kernel.+(x1, x2)
+    s2 = Kernel.+(x3, x4)
+    sum_axis_u64_to_s64(rest, Kernel.+(acc, Kernel.+(s1, s2)))
+  end
+
+  defp sum_axis_u64_to_s64(<<x::unsigned-native-64, rest::binary>>, acc),
+    do: sum_axis_u64_to_s64(rest, Kernel.+(acc, x))
+
+  defp sum_axis_u64_to_s64(<<>>, acc), do: <<acc::signed-native-64>>
+
+  defp sum_axis_u32(
+         <<x1::unsigned-native-32, x2::unsigned-native-32, x3::unsigned-native-32,
+           x4::unsigned-native-32, rest::binary>>,
+         acc
+       ) do
+    s1 = Kernel.+(x1, x2)
+    s2 = Kernel.+(x3, x4)
+    sum_axis_u32(rest, Kernel.+(acc, Kernel.+(s1, s2)))
+  end
+
+  defp sum_axis_u32(<<x::unsigned-native-32, rest::binary>>, acc),
+    do: sum_axis_u32(rest, Kernel.+(acc, x))
+
+  defp sum_axis_u32(<<>>, acc), do: <<acc::unsigned-native-32>>
+
+  # Product helpers
+
+  defp prod_axis_f32(
+         <<x1::float-native-32, x2::float-native-32, x3::float-native-32, x4::float-native-32,
+           rest::binary>>,
+         acc
+       )
+       when is_float(acc) do
+    acc =
+      acc
+      |> Kernel.*(x1)
+      |> Kernel.*(x2)
+      |> Kernel.*(x3)
+      |> Kernel.*(x4)
+
+    prod_axis_f32(rest, acc)
+  end
+
+  defp prod_axis_f32(<<x::float-native-32, rest::binary>>, acc) when is_float(acc),
+    do: prod_axis_f32(rest, Kernel.*(acc, x))
+
+  defp prod_axis_f32(<<x_bin::32-bits, rest::binary>>, acc) do
+    x =
+      case x_bin do
+        <<f::float-native-32>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 32)
+      end
+
+    prod_axis_f32(rest, Complex.multiply(acc, x))
+  end
+
+  defp prod_axis_f32(<<>>, acc) when is_float(acc), do: <<acc::float-native-32>>
+  defp prod_axis_f32(<<>>, acc), do: scalar_to_binary!(acc, {:f, 32})
+
+  defp prod_axis_f64(
+         <<x1::float-native-64, x2::float-native-64, x3::float-native-64, x4::float-native-64,
+           rest::binary>>,
+         acc
+       )
+       when is_float(acc) do
+    acc =
+      acc
+      |> Kernel.*(x1)
+      |> Kernel.*(x2)
+      |> Kernel.*(x3)
+      |> Kernel.*(x4)
+
+    prod_axis_f64(rest, acc)
+  end
+
+  defp prod_axis_f64(<<x::float-native-64, rest::binary>>, acc) when is_float(acc),
+    do: prod_axis_f64(rest, Kernel.*(acc, x))
+
+  defp prod_axis_f64(<<x_bin::64-bits, rest::binary>>, acc) do
+    x =
+      case x_bin do
+        <<f::float-native-64>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 64)
+      end
+
+    prod_axis_f64(rest, Complex.multiply(acc, x))
+  end
+
+  defp prod_axis_f64(<<>>, acc) when is_float(acc), do: <<acc::float-native-64>>
+  defp prod_axis_f64(<<>>, acc), do: scalar_to_binary!(acc, {:f, 64})
+
+  defp prod_axis_s64(
+         <<x1::signed-native-64, x2::signed-native-64, x3::signed-native-64, x4::signed-native-64,
+           rest::binary>>,
+         acc
+       ) do
+    p1 = Kernel.*(x1, x2)
+    p2 = Kernel.*(x3, x4)
+    prod_axis_s64(rest, Kernel.*(acc, Kernel.*(p1, p2)))
+  end
+
+  defp prod_axis_s64(<<x::signed-native-64, rest::binary>>, acc),
+    do: prod_axis_s64(rest, Kernel.*(acc, x))
+
+  defp prod_axis_s64(<<>>, acc), do: <<acc::signed-native-64>>
+
+  defp prod_axis_s32(
+         <<x1::signed-native-32, x2::signed-native-32, x3::signed-native-32, x4::signed-native-32,
+           rest::binary>>,
+         acc
+       ) do
+    p1 = Kernel.*(x1, x2)
+    p2 = Kernel.*(x3, x4)
+    prod_axis_s32(rest, Kernel.*(acc, Kernel.*(p1, p2)))
+  end
+
+  defp prod_axis_s32(<<x::signed-native-32, rest::binary>>, acc),
+    do: prod_axis_s32(rest, Kernel.*(acc, x))
+
+  defp prod_axis_s32(<<>>, acc), do: <<acc::signed-native-32>>
+
+  defp fallback_axis_reducer(op, {_, size} = in_type, out_type) do
+    {acc_init, step_fun} =
+      case op do
+        :sum -> {0, &Complex.add/2}
+        :prod -> {1, &Complex.multiply/2}
+      end
+
+    fn axis ->
+      result =
+        for <<bin::size(^size)-bitstring <- axis>>, reduce: acc_init do
+          acc -> step_fun.(acc, binary_to_number(bin, in_type))
+        end
+
+      scalar_to_binary!(result, out_type)
+    end
+  end
 
   defp non_finite_lt(:nan, _), do: false
   defp non_finite_lt(_, :nan), do: false
