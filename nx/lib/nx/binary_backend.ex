@@ -1354,15 +1354,8 @@ defmodule Nx.BinaryBackend do
   end
 
   @impl true
-  def reduce_max(out, %{type: type} = tensor, opts) do
-    data =
-      bin_reduce(tensor, out.type, :first, opts, fn bin, acc ->
-        val = binary_to_number(bin, type)
-        res = if acc == :first, do: val, else: non_finite_max(acc, val)
-        {res, res}
-      end)
-
-    from_binary(out, data)
+  def reduce_max(out, tensor, opts) do
+    from_binary(out, bin_reduce(:max, tensor, out.type, opts))
   end
 
   defp non_finite_max(:nan, _), do: :nan
@@ -1374,15 +1367,8 @@ defmodule Nx.BinaryBackend do
   defp non_finite_max(x, y) when is_number(x) and is_number(y), do: Kernel.max(x, y)
 
   @impl true
-  def reduce_min(out, %{type: type} = tensor, opts) do
-    data =
-      bin_reduce(tensor, out.type, :first, opts, fn bin, acc ->
-        val = binary_to_number(bin, type)
-        res = if acc == :first, do: val, else: non_finite_min(acc, val)
-        {res, res}
-      end)
-
-    from_binary(out, data)
+  def reduce_min(out, tensor, opts) do
+    from_binary(out, bin_reduce(:min, tensor, out.type, opts))
   end
 
   defp non_finite_min(:nan, _), do: :nan
@@ -1392,6 +1378,208 @@ defmodule Nx.BinaryBackend do
   defp non_finite_min(:neg_infinity, _), do: :neg_infinity
   defp non_finite_min(_, :neg_infinity), do: :neg_infinity
   defp non_finite_min(x, y) when is_number(x) and is_number(y), do: Kernel.min(x, y)
+
+  defp bin_reduce(op, %T{type: {_, size} = in_type, shape: shape} = tensor, out_type, opts)
+       when op in [:max, :min] do
+    reducer = axis_reducer(op, in_type, out_type)
+
+    view =
+      if axes = opts[:axes] do
+        aggregate_axes(to_binary(tensor), axes, shape, size)
+      else
+        [to_binary(tensor)]
+      end
+
+    for axis <- view, into: <<>>, do: reducer.(axis)
+  end
+
+  # Max
+  defp axis_reducer(:max, {:f, 32}, {:f, 32}), do: &max_axis_f32/1
+  defp axis_reducer(:max, {:f, 64}, {:f, 64}), do: &max_axis_f64/1
+  defp axis_reducer(:max, {:s, 64}, {:s, 64}), do: &max_axis_s64/1
+  defp axis_reducer(:max, {:s, 32}, {:s, 32}), do: &max_axis_s32/1
+
+  # Min
+  defp axis_reducer(:min, {:f, 32}, {:f, 32}), do: &min_axis_f32/1
+  defp axis_reducer(:min, {:f, 64}, {:f, 64}), do: &min_axis_f64/1
+  defp axis_reducer(:min, {:s, 64}, {:s, 64}), do: &min_axis_s64/1
+  defp axis_reducer(:min, {:s, 32}, {:s, 32}), do: &min_axis_s32/1
+
+  defp axis_reducer(op, in_type, out_type), do: fallback_axis_reducer(op, in_type, out_type)
+
+  # Max helpers
+
+  defp max_axis_f32(<<x::float-native-32, rest::binary>>), do: max_axis_f32(rest, x)
+  defp max_axis_f32(<<x_bin::32-bits, rest::binary>>),
+    do: max_axis_f32(rest, Nx.Shared.read_non_finite(x_bin, 32))
+
+  defp max_axis_f32(
+         <<x1::float-native-32, x2::float-native-32, x3::float-native-32, x4::float-native-32,
+           rest::binary>>,
+         cur
+       )
+       when is_float(cur) do
+    c1 = if(x1 > cur, do: x1, else: cur)
+    c2 = if(x2 > c1, do: x2, else: c1)
+    c3 = if(x3 > c2, do: x3, else: c2)
+    c4 = if(x4 > c3, do: x4, else: c3)
+    max_axis_f32(rest, c4)
+  end
+
+  defp max_axis_f32(<<x::float-native-32, rest::binary>>, cur) when is_float(cur),
+    do: max_axis_f32(rest, if(x > cur, do: x, else: cur))
+
+  defp max_axis_f32(<<x_bin::32-bits, rest::binary>>, cur) do
+    x =
+      case x_bin do
+        <<f::float-native-32>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 32)
+      end
+
+    max_axis_f32(rest, non_finite_max(cur, x))
+  end
+
+  defp max_axis_f32(<<>>, cur) when is_float(cur), do: <<cur::float-native-32>>
+  defp max_axis_f32(<<>>, cur), do: scalar_to_binary!(cur, {:f, 32})
+
+  defp max_axis_f64(<<x::float-native-64, rest::binary>>), do: max_axis_f64(rest, x)
+  defp max_axis_f64(<<x_bin::64-bits, rest::binary>>),
+    do: max_axis_f64(rest, Nx.Shared.read_non_finite(x_bin, 64))
+
+  defp max_axis_f64(
+         <<x1::float-native-64, x2::float-native-64, x3::float-native-64, x4::float-native-64,
+           rest::binary>>,
+         cur
+       )
+       when is_float(cur) do
+    c1 = if(x1 > cur, do: x1, else: cur)
+    c2 = if(x2 > c1, do: x2, else: c1)
+    c3 = if(x3 > c2, do: x3, else: c2)
+    c4 = if(x4 > c3, do: x4, else: c3)
+    max_axis_f64(rest, c4)
+  end
+
+  defp max_axis_f64(<<x::float-native-64, rest::binary>>, cur) when is_float(cur),
+    do: max_axis_f64(rest, if(x > cur, do: x, else: cur))
+
+  defp max_axis_f64(<<x_bin::64-bits, rest::binary>>, cur) do
+    x =
+      case x_bin do
+        <<f::float-native-64>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 64)
+      end
+
+    max_axis_f64(rest, non_finite_max(cur, x))
+  end
+
+  defp max_axis_f64(<<>>, cur) when is_float(cur), do: <<cur::float-native-64>>
+  defp max_axis_f64(<<>>, cur), do: scalar_to_binary!(cur, {:f, 64})
+
+  defp max_axis_s64(<<first::signed-native-64, rest::binary>>), do: max_axis_s64(rest, first)
+  defp max_axis_s64(<<x::signed-native-64, rest::binary>>, cur),
+    do: max_axis_s64(rest, if(x > cur, do: x, else: cur))
+  defp max_axis_s64(<<>>, cur), do: <<cur::signed-native-64>>
+
+  defp max_axis_s32(<<first::signed-native-32, rest::binary>>), do: max_axis_s32(rest, first)
+  defp max_axis_s32(<<x::signed-native-32, rest::binary>>, cur),
+    do: max_axis_s32(rest, if(x > cur, do: x, else: cur))
+  defp max_axis_s32(<<>>, cur), do: <<cur::signed-native-32>>
+
+  # Min helpers
+
+  defp min_axis_f32(<<x::float-native-32, rest::binary>>), do: min_axis_f32(rest, x)
+  defp min_axis_f32(<<x_bin::32-bits, rest::binary>>),
+    do: min_axis_f32(rest, Nx.Shared.read_non_finite(x_bin, 32))
+
+  defp min_axis_f32(
+         <<x1::float-native-32, x2::float-native-32, x3::float-native-32, x4::float-native-32,
+           rest::binary>>,
+         cur
+       )
+       when is_float(cur) do
+    c1 = if(x1 < cur, do: x1, else: cur)
+    c2 = if(x2 < c1, do: x2, else: c1)
+    c3 = if(x3 < c2, do: x3, else: c2)
+    c4 = if(x4 < c3, do: x4, else: c3)
+    min_axis_f32(rest, c4)
+  end
+
+  defp min_axis_f32(<<x::float-native-32, rest::binary>>, cur) when is_float(cur),
+    do: min_axis_f32(rest, if(x < cur, do: x, else: cur))
+
+  defp min_axis_f32(<<x_bin::32-bits, rest::binary>>, cur) do
+    x =
+      case x_bin do
+        <<f::float-native-32>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 32)
+      end
+
+    min_axis_f32(rest, non_finite_min(cur, x))
+  end
+
+  defp min_axis_f32(<<>>, cur) when is_float(cur), do: <<cur::float-native-32>>
+  defp min_axis_f32(<<>>, cur), do: scalar_to_binary!(cur, {:f, 32})
+
+  defp min_axis_f64(<<x::float-native-64, rest::binary>>), do: min_axis_f64(rest, x)
+  defp min_axis_f64(<<x_bin::64-bits, rest::binary>>),
+    do: min_axis_f64(rest, Nx.Shared.read_non_finite(x_bin, 64))
+
+  defp min_axis_f64(
+         <<x1::float-native-64, x2::float-native-64, x3::float-native-64, x4::float-native-64,
+           rest::binary>>,
+         cur
+       )
+       when is_float(cur) do
+    c1 = if(x1 < cur, do: x1, else: cur)
+    c2 = if(x2 < c1, do: x2, else: c1)
+    c3 = if(x3 < c2, do: x3, else: c2)
+    c4 = if(x4 < c3, do: x4, else: c3)
+    min_axis_f64(rest, c4)
+  end
+
+  defp min_axis_f64(<<x::float-native-64, rest::binary>>, cur) when is_float(cur),
+    do: min_axis_f64(rest, if(x < cur, do: x, else: cur))
+
+  defp min_axis_f64(<<x_bin::64-bits, rest::binary>>, cur) do
+    x =
+      case x_bin do
+        <<f::float-native-64>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 64)
+      end
+
+    min_axis_f64(rest, non_finite_min(cur, x))
+  end
+
+  defp min_axis_f64(<<>>, cur) when is_float(cur), do: <<cur::float-native-64>>
+  defp min_axis_f64(<<>>, cur), do: scalar_to_binary!(cur, {:f, 64})
+
+  defp min_axis_s64(<<first::signed-native-64, rest::binary>>), do: min_axis_s64(rest, first)
+  defp min_axis_s64(<<x::signed-native-64, rest::binary>>, cur),
+    do: min_axis_s64(rest, if(x < cur, do: x, else: cur))
+  defp min_axis_s64(<<>>, cur), do: <<cur::signed-native-64>>
+
+  defp min_axis_s32(<<first::signed-native-32, rest::binary>>), do: min_axis_s32(rest, first)
+  defp min_axis_s32(<<x::signed-native-32, rest::binary>>, cur),
+    do: min_axis_s32(rest, if(x < cur, do: x, else: cur))
+  defp min_axis_s32(<<>>, cur), do: <<cur::signed-native-32>>
+
+  defp fallback_axis_reducer(op, {_, size} = in_type, out_type) do
+    step_fun =
+      case op do
+        :max -> &non_finite_max/2
+        :min -> &non_finite_min/2
+      end
+
+    fn axis ->
+      result =
+        for <<bin::size(^size)-bitstring <- axis>>, reduce: :first do
+          :first -> binary_to_number(bin, in_type)
+          acc -> step_fun.(acc, binary_to_number(bin, in_type))
+        end
+
+      scalar_to_binary!(result, out_type)
+    end
+  end
 
   defp non_finite_lt(:nan, _), do: false
   defp non_finite_lt(_, :nan), do: false
