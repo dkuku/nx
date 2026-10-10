@@ -547,16 +547,12 @@ defmodule Nx.BinaryBackend do
     from_binary(out, bin_result)
   end
 
-  defp bin_dot(%{type: t1} = left, contract_axes1, %{type: t2} = right, contract_axes2, type) do
+  defp bin_dot(%{type: _t1} = left, contract_axes1, %{type: _t2} = right, contract_axes2, type) do
     {left, left_contract_axes} = bin_dot_transpose_contract_axes(left, contract_axes1)
 
     {right, right_contract_axes} = bin_dot_transpose_contract_axes(right, contract_axes2)
 
-    bin_zip_reduce(left, left_contract_axes, right, right_contract_axes, type, 0, fn
-      lhs, rhs, acc ->
-        res = binary_to_number(lhs, t1) * binary_to_number(rhs, t2) + acc
-        {res, res}
-    end)
+    bin_dot_reduce(left, left_contract_axes, right, right_contract_axes, type)
   end
 
   defp bin_dot_transpose_contract_axes(tensor, contract_axes) do
@@ -2365,15 +2361,185 @@ defmodule Nx.BinaryBackend do
     end
   end
 
-  defp bin_zip_reduce(t1, [_ | _] = axes1, t2, [_ | _] = axes2, type, acc, fun) do
+  defp bin_dot_reduce(t1, [_ | _] = axes1, t2, [_ | _] = axes2, type) do
+    reducer = dot_axis_reducer(t1.type, t2.type, type)
     {_, s1} = t1.type
     {_, s2} = t2.type
 
     v1 = aggregate_axes(to_binary(t1), axes1, t1.shape, s1)
     v2 = aggregate_axes(to_binary(t2), axes2, t2.shape, s2)
 
-    for b1 <- v1, b2 <- v2 do
-      {bin, _acc} = bin_zip_reduce_axis(b1, b2, s1, s2, <<>>, acc, fun)
+    for b1 <- v1, b2 <- v2, into: <<>>, do: reducer.(b1, b2)
+  end
+
+  defp dot_axis_reducer({:f, 32}, {:f, 32}, {:f, 32}), do: &dot_axis_f32(&1, &2, 0.0)
+  defp dot_axis_reducer({:f, 64}, {:f, 64}, {:f, 64}), do: &dot_axis_f64(&1, &2, 0.0)
+  defp dot_axis_reducer({:s, 64}, {:s, 64}, {:s, 64}), do: &dot_axis_s64(&1, &2, 0)
+  defp dot_axis_reducer({:s, 32}, {:s, 32}, {:s, 32}), do: &dot_axis_s32(&1, &2, 0)
+  defp dot_axis_reducer({:u, 64}, {:u, 64}, {:u, 64}), do: &dot_axis_u64(&1, &2, 0)
+  defp dot_axis_reducer({:u, 32}, {:u, 32}, {:u, 32}), do: &dot_axis_u32(&1, &2, 0)
+  defp dot_axis_reducer(t1, t2, type), do: fallback_dot_axis_reducer(t1, t2, type)
+
+  defp dot_axis_f32(
+         <<x1::float-native-32, x2::float-native-32, x3::float-native-32, x4::float-native-32,
+           rest1::binary>>,
+         <<y1::float-native-32, y2::float-native-32, y3::float-native-32, y4::float-native-32,
+           rest2::binary>>,
+         acc
+       )
+       when is_float(acc) do
+    p1 = Kernel.*(x1, y1)
+    p2 = Kernel.*(x2, y2)
+    p3 = Kernel.*(x3, y3)
+    p4 = Kernel.*(x4, y4)
+    dot_axis_f32(rest1, rest2, Kernel.+(acc, Kernel.+(Kernel.+(p1, p2), Kernel.+(p3, p4))))
+  end
+
+  defp dot_axis_f32(<<x::float-native-32, rest1::binary>>, <<y::float-native-32, rest2::binary>>, acc)
+       when is_float(acc),
+       do: dot_axis_f32(rest1, rest2, Kernel.+(acc, Kernel.*(x, y)))
+
+  defp dot_axis_f32(<<x_bin::32-bits, rest1::binary>>, <<y_bin::32-bits, rest2::binary>>, acc) do
+    x =
+      case x_bin do
+        <<f::float-native-32>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 32)
+      end
+
+    y =
+      case y_bin do
+        <<f::float-native-32>> -> f
+        _ -> Nx.Shared.read_non_finite(y_bin, 32)
+      end
+
+    dot_axis_f32(rest1, rest2, Complex.add(acc, Complex.multiply(x, y)))
+  end
+
+  defp dot_axis_f32(<<>>, <<>>, acc) when is_float(acc), do: <<acc::float-native-32>>
+  defp dot_axis_f32(<<>>, <<>>, acc), do: scalar_to_binary!(acc, {:f, 32})
+
+  defp dot_axis_f64(
+         <<x1::float-native-64, x2::float-native-64, x3::float-native-64, x4::float-native-64,
+           rest1::binary>>,
+         <<y1::float-native-64, y2::float-native-64, y3::float-native-64, y4::float-native-64,
+           rest2::binary>>,
+         acc
+       )
+       when is_float(acc) do
+    p1 = Kernel.*(x1, y1)
+    p2 = Kernel.*(x2, y2)
+    p3 = Kernel.*(x3, y3)
+    p4 = Kernel.*(x4, y4)
+    dot_axis_f64(rest1, rest2, Kernel.+(acc, Kernel.+(Kernel.+(p1, p2), Kernel.+(p3, p4))))
+  end
+
+  defp dot_axis_f64(<<x::float-native-64, rest1::binary>>, <<y::float-native-64, rest2::binary>>, acc)
+       when is_float(acc),
+       do: dot_axis_f64(rest1, rest2, Kernel.+(acc, Kernel.*(x, y)))
+
+  defp dot_axis_f64(<<x_bin::64-bits, rest1::binary>>, <<y_bin::64-bits, rest2::binary>>, acc) do
+    x =
+      case x_bin do
+        <<f::float-native-64>> -> f
+        _ -> Nx.Shared.read_non_finite(x_bin, 64)
+      end
+
+    y =
+      case y_bin do
+        <<f::float-native-64>> -> f
+        _ -> Nx.Shared.read_non_finite(y_bin, 64)
+      end
+
+    dot_axis_f64(rest1, rest2, Complex.add(acc, Complex.multiply(x, y)))
+  end
+
+  defp dot_axis_f64(<<>>, <<>>, acc) when is_float(acc), do: <<acc::float-native-64>>
+  defp dot_axis_f64(<<>>, <<>>, acc), do: scalar_to_binary!(acc, {:f, 64})
+
+  defp dot_axis_s64(
+         <<x1::signed-native-64, x2::signed-native-64, x3::signed-native-64, x4::signed-native-64,
+           rest1::binary>>,
+         <<y1::signed-native-64, y2::signed-native-64, y3::signed-native-64, y4::signed-native-64,
+           rest2::binary>>,
+         acc
+       ) do
+    p1 = Kernel.*(x1, y1)
+    p2 = Kernel.*(x2, y2)
+    p3 = Kernel.*(x3, y3)
+    p4 = Kernel.*(x4, y4)
+    dot_axis_s64(rest1, rest2, Kernel.+(acc, Kernel.+(Kernel.+(p1, p2), Kernel.+(p3, p4))))
+  end
+
+  defp dot_axis_s64(<<x::signed-native-64, rest1::binary>>, <<y::signed-native-64, rest2::binary>>, acc),
+    do: dot_axis_s64(rest1, rest2, Kernel.+(acc, Kernel.*(x, y)))
+
+  defp dot_axis_s64(<<>>, <<>>, acc), do: <<acc::signed-native-64>>
+
+  defp dot_axis_s32(
+         <<x1::signed-native-32, x2::signed-native-32, x3::signed-native-32, x4::signed-native-32,
+           rest1::binary>>,
+         <<y1::signed-native-32, y2::signed-native-32, y3::signed-native-32, y4::signed-native-32,
+           rest2::binary>>,
+         acc
+       ) do
+    p1 = Kernel.*(x1, y1)
+    p2 = Kernel.*(x2, y2)
+    p3 = Kernel.*(x3, y3)
+    p4 = Kernel.*(x4, y4)
+    dot_axis_s32(rest1, rest2, Kernel.+(acc, Kernel.+(Kernel.+(p1, p2), Kernel.+(p3, p4))))
+  end
+
+  defp dot_axis_s32(<<x::signed-native-32, rest1::binary>>, <<y::signed-native-32, rest2::binary>>, acc),
+    do: dot_axis_s32(rest1, rest2, Kernel.+(acc, Kernel.*(x, y)))
+
+  defp dot_axis_s32(<<>>, <<>>, acc), do: <<acc::signed-native-32>>
+
+  defp dot_axis_u64(
+         <<x1::unsigned-native-64, x2::unsigned-native-64, x3::unsigned-native-64,
+           x4::unsigned-native-64, rest1::binary>>,
+         <<y1::unsigned-native-64, y2::unsigned-native-64, y3::unsigned-native-64,
+           y4::unsigned-native-64, rest2::binary>>,
+         acc
+       ) do
+    p1 = Kernel.*(x1, y1)
+    p2 = Kernel.*(x2, y2)
+    p3 = Kernel.*(x3, y3)
+    p4 = Kernel.*(x4, y4)
+    dot_axis_u64(rest1, rest2, Kernel.+(acc, Kernel.+(Kernel.+(p1, p2), Kernel.+(p3, p4))))
+  end
+
+  defp dot_axis_u64(<<x::unsigned-native-64, rest1::binary>>, <<y::unsigned-native-64, rest2::binary>>, acc),
+    do: dot_axis_u64(rest1, rest2, Kernel.+(acc, Kernel.*(x, y)))
+
+  defp dot_axis_u64(<<>>, <<>>, acc), do: <<acc::unsigned-native-64>>
+
+  defp dot_axis_u32(
+         <<x1::unsigned-native-32, x2::unsigned-native-32, x3::unsigned-native-32,
+           x4::unsigned-native-32, rest1::binary>>,
+         <<y1::unsigned-native-32, y2::unsigned-native-32, y3::unsigned-native-32,
+           y4::unsigned-native-32, rest2::binary>>,
+         acc
+       ) do
+    p1 = Kernel.*(x1, y1)
+    p2 = Kernel.*(x2, y2)
+    p3 = Kernel.*(x3, y3)
+    p4 = Kernel.*(x4, y4)
+    dot_axis_u32(rest1, rest2, Kernel.+(acc, Kernel.+(Kernel.+(p1, p2), Kernel.+(p3, p4))))
+  end
+
+  defp dot_axis_u32(<<x::unsigned-native-32, rest1::binary>>, <<y::unsigned-native-32, rest2::binary>>, acc),
+    do: dot_axis_u32(rest1, rest2, Kernel.+(acc, Kernel.*(x, y)))
+
+  defp dot_axis_u32(<<>>, <<>>, acc), do: <<acc::unsigned-native-32>>
+
+  defp fallback_dot_axis_reducer({_, s1} = t1, {_, s2} = t2, type) do
+    fn b1, b2 ->
+      {bin, _acc} =
+        bin_zip_reduce_axis(b1, b2, s1, s2, <<>>, 0, fn lhs, rhs, acc ->
+          res = binary_to_number(lhs, t1) * binary_to_number(rhs, t2) + acc
+          {res, res}
+        end)
+
       scalar_to_binary!(bin, type)
     end
   end
@@ -2512,7 +2678,7 @@ defmodule Nx.BinaryBackend do
   defp aggregate_path([], [], _i, pre, pos), do: {pre, pos}
 
   defp aggregate_read([{axis, weight} | shape], i, [i | axis], _size),
-    do: aggregate_read(shape, i - 1, axis, axis * weight)
+    do: aggregate_read(shape, i - 1, axis, axis * weight) |> dbg
 
   defp aggregate_read(shape, _i, _axis, size),
     do: {shape, size}
